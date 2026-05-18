@@ -227,6 +227,9 @@ http://127.0.0.1:8001/v1
 
 - 插件配置页显示“这个插件没有配置”
 - Provider 页面新增 `vLLM Embedding` 卡片
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/45e1be1c-fc75-4bdf-a010-1b96a6ee61f7" width="100%">
+</p>
 
 ### 3. 在 AstrBot 中创建 `vLLM Embedding` provider
 
@@ -236,6 +239,9 @@ http://127.0.0.1:8001/v1
 2. 切换到 `Embedding`
 3. 点击 `新增模型提供商`
 4. 选择 `vLLM Embedding`
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/6df146c6-6e86-44a0-86f9-36b22367e1b1" width="100%">
+</p>
 
 当前默认值大致如下：
 
