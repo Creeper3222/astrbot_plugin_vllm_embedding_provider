@@ -9,7 +9,15 @@
 ## 它解决了什么问题
 
 如果你直接把 vLLM 的 Embedding 服务地址填进 AstrBot 原生 `OpenAI Embedding` 提供商，常见痛点通常有这几类：
-
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/d2c02486-b5dd-4e6e-afcf-0fb8f44500e2" width="500">
+</p>
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/4fadef93-44ac-4615-b950-5829b29e38ff" width="500">
+</p>
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/d98fa19c-099c-42d7-afa8-cc94acc30fac" width="500">
+</p>
 - AstrBot / OpenAI 侧习惯会主动传 `dimensions`，但 vLLM 的 OpenAI-compatible Embedding 路径并不保证接受这个参数。
 - 你在配置里填的是 HuggingFace 模型名，例如 `BAAI/bge-m3`，但 vLLM 实际对外暴露的 `served-model-name` 往往只有 `bge-m3`。
 - 本地或内网部署时，Python 环境变量里的代理可能会劫持请求，导致明明是 `127.0.0.1` 或局域网地址，却依然被错误地走了代理链路。
