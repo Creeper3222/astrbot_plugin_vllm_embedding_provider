@@ -66,6 +66,7 @@ class VLLMEmbeddingProviderPlugin(Star):
 
     async def terminate(self) -> None:
         _remove_runtime_patches()
+        await _provider.flush_pending_embedding_log_summaries()
         removed_provider = _provider.unregister_vllm_embedding_provider(
             _provider.VLLMEmbeddingProvider.__module__
         )

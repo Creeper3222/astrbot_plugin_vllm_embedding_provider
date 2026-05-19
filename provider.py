@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 from ipaddress import ip_address
+from time import monotonic
 from typing import Any
 from urllib.parse import urlparse
+from weakref import WeakSet
 
 import httpx
 from openai import AsyncOpenAI
@@ -25,6 +29,8 @@ _COMMON_MODEL_DIMENSIONS = {
 _PROVIDER_TYPE_NAME = "vllm_embedding"
 _PROVIDER_DESC = "vLLM Embedding 提供商适配器"
 _PROVIDER_DISPLAY_NAME = "vLLM Embedding"
+_EMBEDDING_LOG_QUIET_WINDOW_SEC = 0.8
+_LIVE_PROVIDER_INSTANCES: WeakSet[VLLMEmbeddingProvider] = WeakSet()
 _DEFAULT_CONFIG_TMPL = {
     "id": "vllm_embedding",
     "type": "vllm_embedding",
@@ -112,6 +118,11 @@ def _register_vllm_embedding_provider(
     return cls
 
 
+async def flush_pending_embedding_log_summaries() -> None:
+    for provider in list(_LIVE_PROVIDER_INSTANCES):
+        await provider.flush_pending_embedding_log_summary()
+
+
 @_register_vllm_embedding_provider
 class VLLMEmbeddingProvider(EmbeddingProvider):
     def __init__(self, provider_config: dict, provider_settings: dict) -> None:
@@ -127,25 +138,39 @@ class VLLMEmbeddingProvider(EmbeddingProvider):
         self._resolved_request_model: str | None = None
         self._direct_client_ready = self._force_direct_transport
 
+        self._embedding_log_flush_task: asyncio.Task[None] | None = None
+        self._embedding_log_window_started_at: float | None = None
+        self._embedding_log_last_activity_at: float | None = None
+        self._embedding_log_inflight = 0
+        self._embedding_log_request_calls = 0
+        self._embedding_log_success_calls = 0
+        self._embedding_log_failure_calls = 0
+        self._embedding_log_single_calls = 0
+        self._embedding_log_batch_calls = 0
+        self._embedding_log_total_items = 0
+        self._embedding_log_total_chars = 0
+        self._embedding_log_last_model = ""
+
         self.client = AsyncOpenAI(
             api_key=provider_config.get("embedding_api_key"),
             base_url=self._effective_api_base(),
             timeout=self.timeout,
             http_client=self._build_http_client(),
         )
+        _LIVE_PROVIDER_INSTANCES.add(self)
 
     async def get_embedding(self, text: str) -> list[float]:
         await self._ensure_runtime_ready()
         request_model = await self._resolve_request_model()
-        logger.info(
-            "[vLLM Embedding] %s 发起单条 embedding 请求，model=%s，text_len=%s，跳过 dimensions。",
+        logger.debug(
+            "[vLLM Embedding] %s 收到单条 embedding 请求，model=%s，text_len=%s，进入聚合窗口。",
             self._provider_id(),
             request_model,
             len(text),
         )
-        embedding = await self.client.embeddings.create(
-            input=text,
-            model=request_model,
+        embedding = await self._create_embeddings(
+            input_data=text,
+            request_model=request_model,
         )
         vector = embedding.data[0].embedding
         self._cache_detected_dimension(len(vector))
@@ -155,16 +180,16 @@ class VLLMEmbeddingProvider(EmbeddingProvider):
         await self._ensure_runtime_ready()
         request_model = await self._resolve_request_model()
         total_chars = sum(len(item) for item in text)
-        logger.info(
-            "[vLLM Embedding] %s 发起批量 embedding 请求，model=%s，batch=%s，total_chars=%s，跳过 dimensions。",
+        logger.debug(
+            "[vLLM Embedding] %s 收到批量 embedding 请求，model=%s，batch=%s，total_chars=%s，进入聚合窗口。",
             self._provider_id(),
             request_model,
             len(text),
             total_chars,
         )
-        embeddings = await self.client.embeddings.create(
-            input=text,
-            model=request_model,
+        embeddings = await self._create_embeddings(
+            input_data=text,
+            request_model=request_model,
         )
         vectors = [item.embedding for item in embeddings.data]
         if vectors:
@@ -183,6 +208,8 @@ class VLLMEmbeddingProvider(EmbeddingProvider):
         return 0
 
     async def terminate(self) -> None:
+        _LIVE_PROVIDER_INSTANCES.discard(self)
+        await self.flush_pending_embedding_log_summary()
         if self.client:
             await self.client.close()
 
@@ -346,3 +373,164 @@ class VLLMEmbeddingProvider(EmbeddingProvider):
 
     def _provider_id(self) -> str:
         return str(self.provider_config.get("id", "unknown") or "unknown")
+
+    async def flush_pending_embedding_log_summary(self) -> None:
+        await self._cancel_embedding_log_flush_task()
+        self._flush_embedding_log_summary()
+
+    async def _create_embeddings(
+        self,
+        input_data: str | list[str],
+        request_model: str,
+    ):
+        if isinstance(input_data, list):
+            item_count = len(input_data)
+            total_chars = sum(len(item) for item in input_data)
+            is_batch = True
+        else:
+            item_count = 1
+            total_chars = len(input_data)
+            is_batch = False
+
+        self._record_embedding_request_started(
+            request_model=request_model,
+            item_count=item_count,
+            total_chars=total_chars,
+            is_batch=is_batch,
+        )
+
+        try:
+            response = await self.client.embeddings.create(
+                input=input_data,
+                model=request_model,
+            )
+        except Exception:
+            self._record_embedding_request_finished(succeeded=False)
+            raise
+
+        self._record_embedding_request_finished(succeeded=True)
+        return response
+
+    def _record_embedding_request_started(
+        self,
+        *,
+        request_model: str,
+        item_count: int,
+        total_chars: int,
+        is_batch: bool,
+    ) -> None:
+        now = monotonic()
+        self._cancel_embedding_log_flush_task_nowait()
+
+        if self._embedding_log_window_started_at is None:
+            self._embedding_log_window_started_at = now
+
+        self._embedding_log_last_activity_at = now
+        self._embedding_log_inflight += 1
+        self._embedding_log_request_calls += 1
+        self._embedding_log_total_items += item_count
+        self._embedding_log_total_chars += total_chars
+        self._embedding_log_last_model = request_model
+
+        if is_batch:
+            self._embedding_log_batch_calls += 1
+        else:
+            self._embedding_log_single_calls += 1
+
+    def _record_embedding_request_finished(self, *, succeeded: bool) -> None:
+        self._embedding_log_last_activity_at = monotonic()
+        self._embedding_log_inflight = max(0, self._embedding_log_inflight - 1)
+
+        if succeeded:
+            self._embedding_log_success_calls += 1
+        else:
+            self._embedding_log_failure_calls += 1
+
+        self._schedule_embedding_log_flush()
+
+    def _schedule_embedding_log_flush(self) -> None:
+        if self._embedding_log_request_calls <= 0:
+            return
+
+        self._cancel_embedding_log_flush_task_nowait()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._flush_embedding_log_summary()
+            return
+
+        self._embedding_log_flush_task = loop.create_task(
+            self._flush_embedding_log_summary_when_idle()
+        )
+
+    async def _flush_embedding_log_summary_when_idle(self) -> None:
+        scheduled_last_activity = self._embedding_log_last_activity_at
+        try:
+            await asyncio.sleep(_EMBEDDING_LOG_QUIET_WINDOW_SEC)
+            if self._embedding_log_inflight > 0:
+                return
+            if scheduled_last_activity is None:
+                return
+            if (self._embedding_log_last_activity_at or 0) > scheduled_last_activity:
+                return
+            self._flush_embedding_log_summary()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            current_task = asyncio.current_task()
+            if self._embedding_log_flush_task is current_task:
+                self._embedding_log_flush_task = None
+
+    def _flush_embedding_log_summary(self) -> None:
+        if self._embedding_log_request_calls <= 0:
+            return
+
+        started_at = self._embedding_log_window_started_at or monotonic()
+        duration = max(0.0, monotonic() - started_at)
+        log_fn = logger.warning if self._embedding_log_failure_calls else logger.info
+        log_fn(
+            "[vLLM Embedding] %s embedding 请求汇总，model=%s，请求=%s（单条=%s，批量=%s），输入条目=%s，成功=%s，失败=%s，总字符=%s，窗口耗时=%.2fs，跳过 dimensions。",
+            self._provider_id(),
+            self._embedding_log_last_model or self.model or "",
+            self._embedding_log_request_calls,
+            self._embedding_log_single_calls,
+            self._embedding_log_batch_calls,
+            self._embedding_log_total_items,
+            self._embedding_log_success_calls,
+            self._embedding_log_failure_calls,
+            self._embedding_log_total_chars,
+            duration,
+        )
+        self._reset_embedding_log_stats()
+
+    def _reset_embedding_log_stats(self) -> None:
+        self._embedding_log_window_started_at = None
+        self._embedding_log_last_activity_at = None
+        self._embedding_log_inflight = 0
+        self._embedding_log_request_calls = 0
+        self._embedding_log_success_calls = 0
+        self._embedding_log_failure_calls = 0
+        self._embedding_log_single_calls = 0
+        self._embedding_log_batch_calls = 0
+        self._embedding_log_total_items = 0
+        self._embedding_log_total_chars = 0
+        self._embedding_log_last_model = ""
+
+    def _cancel_embedding_log_flush_task_nowait(self) -> None:
+        task = self._embedding_log_flush_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._embedding_log_flush_task = None
+
+    async def _cancel_embedding_log_flush_task(self) -> None:
+        task = self._embedding_log_flush_task
+        if task is None:
+            return
+
+        self._embedding_log_flush_task = None
+        if task.done():
+            return
+
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
