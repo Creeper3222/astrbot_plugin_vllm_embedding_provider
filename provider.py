@@ -8,9 +8,9 @@ import httpx
 from openai import AsyncOpenAI
 
 from astrbot import logger
-from astrbot.core.provider.entities import ProviderType
+from astrbot.core.provider.entities import ProviderMetaData, ProviderType
 from astrbot.core.provider.provider import EmbeddingProvider
-from astrbot.core.provider.register import register_provider_adapter
+from astrbot.core.provider.register import provider_cls_map, provider_registry
 
 
 _COMMON_MODEL_DIMENSIONS = {
@@ -22,27 +22,97 @@ _COMMON_MODEL_DIMENSIONS = {
     "text-embedding-ada-002": 1536,
 }
 
+_PROVIDER_TYPE_NAME = "vllm_embedding"
+_PROVIDER_DESC = "vLLM Embedding 提供商适配器"
+_PROVIDER_DISPLAY_NAME = "vLLM Embedding"
+_DEFAULT_CONFIG_TMPL = {
+    "id": "vllm_embedding",
+    "type": "vllm_embedding",
+    "provider": "vllm",
+    "provider_type": "embedding",
+    "hint": "面向 vLLM OpenAI-compatible Embedding 接口的独立提供商。会自动忽略 dimensions，并尝试将模型名对齐到 served-model-name。",
+    "enable": False,
+    "embedding_api_key": "",
+    "embedding_api_base": "",
+    "embedding_model": "",
+    "embedding_dimensions": "",
+    "timeout": 20,
+    "proxy": "",
+}
 
-@register_provider_adapter(
-    "vllm_embedding",
-    "vLLM Embedding 提供商适配器",
-    provider_type=ProviderType.EMBEDDING,
-    provider_display_name="vLLM Embedding",
-    default_config_tmpl={
-        "id": "vllm_embedding",
-        "type": "vllm_embedding",
-        "provider": "vllm",
-        "provider_type": "embedding",
-        "hint": "面向 vLLM OpenAI-compatible Embedding 接口的独立提供商。会自动忽略 dimensions，并尝试将模型名对齐到 served-model-name。",
-        "enable": False,
-        "embedding_api_key": "",
-        "embedding_api_base": "",
-        "embedding_model": "",
-        "embedding_dimensions": "",
-        "timeout": 20,
-        "proxy": "",
-    },
-)
+
+def _build_provider_metadata(cls: type[EmbeddingProvider]) -> ProviderMetaData:
+    default_config_tmpl = dict(_DEFAULT_CONFIG_TMPL)
+    if "type" not in default_config_tmpl:
+        default_config_tmpl["type"] = _PROVIDER_TYPE_NAME
+    if "enable" not in default_config_tmpl:
+        default_config_tmpl["enable"] = False
+    if "id" not in default_config_tmpl:
+        default_config_tmpl["id"] = _PROVIDER_TYPE_NAME
+
+    return ProviderMetaData(
+        id="default",
+        model=None,
+        type=_PROVIDER_TYPE_NAME,
+        desc=_PROVIDER_DESC,
+        provider_type=ProviderType.EMBEDDING,
+        cls_type=cls,
+        default_config_tmpl=default_config_tmpl,
+        provider_display_name=_PROVIDER_DISPLAY_NAME,
+    )
+
+
+def unregister_vllm_embedding_provider(module_name: str | None = None) -> bool:
+    removed = False
+
+    existing = provider_cls_map.get(_PROVIDER_TYPE_NAME)
+    if existing is not None:
+        existing_module_name = getattr(existing.cls_type, "__module__", "")
+        if module_name is None or existing_module_name == module_name:
+            provider_cls_map.pop(_PROVIDER_TYPE_NAME, None)
+            removed = True
+
+    filtered_registry: list[ProviderMetaData] = []
+    for metadata in provider_registry:
+        metadata_module_name = getattr(metadata.cls_type, "__module__", "")
+        if metadata.type == _PROVIDER_TYPE_NAME and (
+            module_name is None or metadata_module_name == module_name
+        ):
+            removed = True
+            continue
+        filtered_registry.append(metadata)
+
+    if len(filtered_registry) != len(provider_registry):
+        provider_registry[:] = filtered_registry
+
+    if removed:
+        logger.info("[vLLM Embedding] 已清理 provider 注册: %s。", _PROVIDER_TYPE_NAME)
+    return removed
+
+
+def _register_vllm_embedding_provider(
+    cls: type[EmbeddingProvider],
+) -> type[EmbeddingProvider]:
+    existing = provider_cls_map.get(_PROVIDER_TYPE_NAME)
+    if existing is not None:
+        existing_module_name = getattr(existing.cls_type, "__module__", "")
+        if existing_module_name != cls.__module__:
+            raise ValueError(
+                f"检测到大模型提供商适配器 {_PROVIDER_TYPE_NAME} 已经注册，可能发生了大模型提供商适配器类型命名冲突。",
+            )
+        unregister_vllm_embedding_provider(existing_module_name)
+        logger.warning(
+            "[vLLM Embedding] 检测到热重载残留 provider 注册，已替换为最新实现。"
+        )
+
+    provider_metadata = _build_provider_metadata(cls)
+    provider_registry.append(provider_metadata)
+    provider_cls_map[_PROVIDER_TYPE_NAME] = provider_metadata
+    logger.debug("Model provider registered: %s", _PROVIDER_TYPE_NAME)
+    return cls
+
+
+@_register_vllm_embedding_provider
 class VLLMEmbeddingProvider(EmbeddingProvider):
     def __init__(self, provider_config: dict, provider_settings: dict) -> None:
         super().__init__(provider_config, provider_settings)

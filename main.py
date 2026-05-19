@@ -65,9 +65,16 @@ class VLLMEmbeddingProviderPlugin(Star):
         logger.info("[vLLM Embedding Provider] 插件初始化完成。")
 
     async def terminate(self) -> None:
-        logger.info(
-            "[vLLM Embedding Provider] 插件停止。若需完全卸载运行时模板/备份同步补丁，请重启 AstrBot。"
+        _remove_runtime_patches()
+        removed_provider = _provider.unregister_vllm_embedding_provider(
+            _provider.VLLMEmbeddingProvider.__module__
         )
+        if removed_provider:
+            logger.info(
+                "[vLLM Embedding Provider] 插件停止，已恢复运行时补丁并清理 provider 注册。"
+            )
+        else:
+            logger.info("[vLLM Embedding Provider] 插件停止，已恢复运行时补丁。")
 
 
 def _apply_runtime_patches() -> None:
@@ -107,6 +114,51 @@ def _apply_runtime_patches() -> None:
     ProviderManager.create_provider = _patched_create_provider
     ProviderManager.update_provider = _patched_update_provider
     ProviderManager.delete_provider = _patched_delete_provider
+
+
+def _restore_original_method(
+    owner: type[Any],
+    original_attr: str,
+    method_name: str,
+) -> None:
+    original_method = getattr(owner, original_attr, None)
+    if callable(original_method):
+        setattr(owner, method_name, original_method)
+    if hasattr(owner, original_attr):
+        delattr(owner, original_attr)
+
+
+def _remove_runtime_patches() -> None:
+    _restore_original_method(
+        ConfigRoute,
+        _ORIGINAL_GET_ASTRBOT_CONFIG_ATTR,
+        "_get_astrbot_config",
+    )
+    _restore_original_method(
+        ConfigRoute,
+        _ORIGINAL_GET_PROVIDER_TEMPLATE_ATTR,
+        "get_provider_template",
+    )
+    if hasattr(ConfigRoute, _CONFIG_ROUTE_PATCH_MARKER):
+        delattr(ConfigRoute, _CONFIG_ROUTE_PATCH_MARKER)
+
+    _restore_original_method(
+        ProviderManager,
+        _ORIGINAL_CREATE_PROVIDER_ATTR,
+        "create_provider",
+    )
+    _restore_original_method(
+        ProviderManager,
+        _ORIGINAL_UPDATE_PROVIDER_ATTR,
+        "update_provider",
+    )
+    _restore_original_method(
+        ProviderManager,
+        _ORIGINAL_DELETE_PROVIDER_ATTR,
+        "delete_provider",
+    )
+    if hasattr(ProviderManager, _PROVIDER_MANAGER_PATCH_MARKER):
+        delattr(ProviderManager, _PROVIDER_MANAGER_PATCH_MARKER)
 
 
 async def _patched_get_astrbot_config(self: ConfigRoute) -> dict[str, Any]:
