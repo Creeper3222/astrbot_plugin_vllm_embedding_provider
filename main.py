@@ -6,10 +6,15 @@ from astrbot.api import logger
 from astrbot.api.star import Context, Star, register
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.provider.manager import ProviderManager
-from astrbot.dashboard.routes.config import ConfigRoute
-from astrbot.dashboard.routes.route import Response
 
-from . import provider as _provider  # noqa: F401
+try:  # AstrBot <= 4.25 legacy dashboard route stack.
+    from astrbot.dashboard.routes.config import ConfigRoute as _LegacyConfigRoute
+    from astrbot.dashboard.routes.route import Response as _LegacyResponse
+except ModuleNotFoundError:  # AstrBot >= 4.26 moved dashboard APIs to dashboard.api/services.
+    _LegacyConfigRoute = None
+    _LegacyResponse = None
+
+from . import provider as _provider  # noqa: F401 - importing registers the provider class
 from .backup_store import (
     PLUGIN_NAME,
     PROVIDER_TYPE,
@@ -18,7 +23,7 @@ from .backup_store import (
 )
 
 
-PLUGIN_DESC = "为 AstrBot 提供独立的 vLLM Embedding 提供商，并将配置镜像备份到 plugin_data。"
+PLUGIN_DESC = "为 AstrBot 提供独立的 vLLM Embedding Provider，并将配置镜像备份到 plugin_data。"
 TEMPLATE_DISPLAY_NAME = "vLLM Embedding"
 
 _CONFIG_ROUTE_PATCH_MARKER = "__vllm_embedding_provider_template_alias_patch__"
@@ -35,7 +40,7 @@ _ORIGINAL_DELETE_PROVIDER_ATTR = "__vllm_embedding_provider_original_delete_prov
     PLUGIN_NAME,
     "Creeper3222",
     PLUGIN_DESC,
-    "v0.1.0",
+    "v0.1.1",
 )
 class VLLMEmbeddingProviderPlugin(Star):
     def __init__(
@@ -55,14 +60,17 @@ class VLLMEmbeddingProviderPlugin(Star):
         if restored_ids:
             core_config.save_config()
             logger.warning(
-                "[vLLM Embedding Provider] 已从 plugin_data 补种缺失的 provider: %s",
+                "[vLLM Embedding Provider] Restored missing provider(s) from plugin_data backup: %s",
                 ", ".join(restored_ids),
             )
 
         self.context.provider_manager.providers_config = core_config["provider"]
+        loaded_ids = await _ensure_vllm_provider_instances(self.context.provider_manager, core_config)
         sync_backup_from_core_config(core_config)
 
-        logger.info("[vLLM Embedding Provider] 插件初始化完成。")
+        if loaded_ids:
+            logger.info("[vLLM Embedding Provider] Loaded existing vLLM provider instance(s): %s", ", ".join(loaded_ids))
+        logger.info("[vLLM Embedding Provider] Initialized. provider_type=%s", PROVIDER_TYPE)
 
     async def terminate(self) -> None:
         _remove_runtime_patches()
@@ -72,25 +80,57 @@ class VLLMEmbeddingProviderPlugin(Star):
         )
         if removed_provider:
             logger.info(
-                "[vLLM Embedding Provider] 插件停止，已恢复运行时补丁并清理 provider 注册。"
+                "[vLLM Embedding Provider] Terminated; runtime patches restored and provider registry cleaned."
             )
         else:
-            logger.info("[vLLM Embedding Provider] 插件停止，已恢复运行时补丁。")
+            logger.info("[vLLM Embedding Provider] Terminated; runtime patches restored.")
+
+
+async def _ensure_vllm_provider_instances(
+    provider_manager: ProviderManager,
+    core_config: AstrBotConfig,
+) -> list[str]:
+    loaded: list[str] = []
+    providers = core_config.get("provider", [])
+    if not isinstance(providers, list):
+        return loaded
+
+    for provider_config in providers:
+        if not isinstance(provider_config, dict):
+            continue
+        if provider_config.get("type") != PROVIDER_TYPE:
+            continue
+        provider_id = str(provider_config.get("id") or "").strip()
+        if not provider_id:
+            continue
+        if provider_id in getattr(provider_manager, "inst_map", {}):
+            continue
+        if not provider_config.get("enable", False):
+            continue
+        await provider_manager.load_provider(provider_config)
+        if provider_id in getattr(provider_manager, "inst_map", {}):
+            loaded.append(provider_id)
+    return loaded
 
 
 def _apply_runtime_patches() -> None:
-    if not getattr(ConfigRoute, _CONFIG_ROUTE_PATCH_MARKER, False):
+    # AstrBot 4.26+ no longer exposes astrbot.dashboard.routes.*.  Provider
+    # schemas are now generated from provider_registry directly, so the old
+    # ConfigRoute alias patch is optional.  Keep it only for older AstrBot.
+    if _LegacyConfigRoute is not None and not getattr(_LegacyConfigRoute, _CONFIG_ROUTE_PATCH_MARKER, False):
         setattr(
-            ConfigRoute,
+            _LegacyConfigRoute,
             _ORIGINAL_GET_ASTRBOT_CONFIG_ATTR,
-            ConfigRoute._get_astrbot_config,
+            _LegacyConfigRoute._get_astrbot_config,
         )
         setattr(
-            ConfigRoute,
+            _LegacyConfigRoute,
             _ORIGINAL_GET_PROVIDER_TEMPLATE_ATTR,
-            ConfigRoute.get_provider_template,
+            _LegacyConfigRoute.get_provider_template,
         )
-        setattr(ConfigRoute, _CONFIG_ROUTE_PATCH_MARKER, True)
+        setattr(_LegacyConfigRoute, _CONFIG_ROUTE_PATCH_MARKER, True)
+        _LegacyConfigRoute._get_astrbot_config = _patched_get_astrbot_config
+        _LegacyConfigRoute.get_provider_template = _patched_get_provider_template
 
     if not getattr(ProviderManager, _PROVIDER_MANAGER_PATCH_MARKER, False):
         setattr(
@@ -109,19 +149,18 @@ def _apply_runtime_patches() -> None:
             ProviderManager.delete_provider,
         )
         setattr(ProviderManager, _PROVIDER_MANAGER_PATCH_MARKER, True)
-
-    ConfigRoute._get_astrbot_config = _patched_get_astrbot_config
-    ConfigRoute.get_provider_template = _patched_get_provider_template
-    ProviderManager.create_provider = _patched_create_provider
-    ProviderManager.update_provider = _patched_update_provider
-    ProviderManager.delete_provider = _patched_delete_provider
+        ProviderManager.create_provider = _patched_create_provider
+        ProviderManager.update_provider = _patched_update_provider
+        ProviderManager.delete_provider = _patched_delete_provider
 
 
 def _restore_original_method(
-    owner: type[Any],
+    owner: type[Any] | None,
     original_attr: str,
     method_name: str,
 ) -> None:
+    if owner is None:
+        return
     original_method = getattr(owner, original_attr, None)
     if callable(original_method):
         setattr(owner, method_name, original_method)
@@ -131,17 +170,17 @@ def _restore_original_method(
 
 def _remove_runtime_patches() -> None:
     _restore_original_method(
-        ConfigRoute,
+        _LegacyConfigRoute,
         _ORIGINAL_GET_ASTRBOT_CONFIG_ATTR,
         "_get_astrbot_config",
     )
     _restore_original_method(
-        ConfigRoute,
+        _LegacyConfigRoute,
         _ORIGINAL_GET_PROVIDER_TEMPLATE_ATTR,
         "get_provider_template",
     )
-    if hasattr(ConfigRoute, _CONFIG_ROUTE_PATCH_MARKER):
-        delattr(ConfigRoute, _CONFIG_ROUTE_PATCH_MARKER)
+    if _LegacyConfigRoute is not None and hasattr(_LegacyConfigRoute, _CONFIG_ROUTE_PATCH_MARKER):
+        delattr(_LegacyConfigRoute, _CONFIG_ROUTE_PATCH_MARKER)
 
     _restore_original_method(
         ProviderManager,
@@ -162,10 +201,10 @@ def _remove_runtime_patches() -> None:
         delattr(ProviderManager, _PROVIDER_MANAGER_PATCH_MARKER)
 
 
-async def _patched_get_astrbot_config(self: ConfigRoute) -> dict[str, Any]:
+async def _patched_get_astrbot_config(self: Any) -> dict[str, Any]:
     original_method = getattr(type(self), _ORIGINAL_GET_ASTRBOT_CONFIG_ATTR, None)
     if not callable(original_method):
-        raise RuntimeError("ConfigRoute._get_astrbot_config 原始实现不存在。")
+        raise RuntimeError("Original ConfigRoute._get_astrbot_config is unavailable.")
 
     result = await original_method(self)
     metadata = result.get("metadata", {}) if isinstance(result, dict) else {}
@@ -180,7 +219,7 @@ async def _patched_get_astrbot_config(self: ConfigRoute) -> dict[str, Any]:
     return result
 
 
-async def _patched_get_provider_template(self: ConfigRoute) -> dict[str, Any]:
+async def _patched_get_provider_template(self: Any) -> dict[str, Any]:
     config_bundle = await self._get_astrbot_config()
     metadata = config_bundle.get("metadata", {}) if isinstance(config_bundle, dict) else {}
     provider_schema = (
@@ -195,7 +234,9 @@ async def _patched_get_provider_template(self: ConfigRoute) -> dict[str, Any]:
         "providers": default_conf.get("provider", []),
         "provider_sources": default_conf.get("provider_sources", []),
     }
-    return Response().ok(data=data).__dict__
+    if _LegacyResponse is not None:
+        return _LegacyResponse().ok(data=data).__dict__
+    return {"status": "ok", "message": None, "data": data}
 
 
 async def _patched_create_provider(
@@ -204,7 +245,7 @@ async def _patched_create_provider(
 ) -> None:
     original_method = getattr(type(self), _ORIGINAL_CREATE_PROVIDER_ATTR, None)
     if not callable(original_method):
-        raise RuntimeError("ProviderManager.create_provider 原始实现不存在。")
+        raise RuntimeError("Original ProviderManager.create_provider is unavailable.")
 
     await original_method(self, new_config)
     sync_backup_from_core_config(self.acm.default_conf)
@@ -217,7 +258,7 @@ async def _patched_update_provider(
 ) -> None:
     original_method = getattr(type(self), _ORIGINAL_UPDATE_PROVIDER_ATTR, None)
     if not callable(original_method):
-        raise RuntimeError("ProviderManager.update_provider 原始实现不存在。")
+        raise RuntimeError("Original ProviderManager.update_provider is unavailable.")
 
     await original_method(self, origin_provider_id, new_config)
     sync_backup_from_core_config(self.acm.default_conf)
@@ -230,7 +271,8 @@ async def _patched_delete_provider(
 ) -> None:
     original_method = getattr(type(self), _ORIGINAL_DELETE_PROVIDER_ATTR, None)
     if not callable(original_method):
-        raise RuntimeError("ProviderManager.delete_provider 原始实现不存在。")
+        raise RuntimeError("Original ProviderManager.delete_provider is unavailable.")
 
     await original_method(self, provider_id=provider_id, provider_source_id=provider_source_id)
     sync_backup_from_core_config(self.acm.default_conf)
+

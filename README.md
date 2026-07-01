@@ -377,4 +377,5 @@ data/plugin_data/astrbot_plugin_vllm_embedding_provider/providers_backup.json
 
 ## 版本
 
-- 当前版本：`v0.1.0`
+- 当前版本：`v0.1.1`
+- `v0.1.1`：兼容 AstrBot 4.26+ dashboard 路由调整，避免旧 `astrbot.dashboard.routes` 导入导致插件加载失败；同时修正插件卡片简述文本编码。

@@ -1,7 +1,7 @@
 name: astrbot_plugin_vllm_embedding_provider
 display_name: vLLM Embedding Provider
-desc: 为 AstrBot 提供独立的 vLLM Embedding 提供商，让用户可以直接以vLLM兼容的方式使用vLLM部署的嵌入模型
-version: v0.1.0
+desc: 为 AstrBot 增加独立的 vLLM Embedding 模型提供商，支持 OpenAI-compatible Embedding 接口、served-model-name 自动匹配与本地/私网直连。
+version: v0.1.1
 author: Creeper3222
 repo: https://github.com/Creeper3222/astrbot_plugin_vllm_embedding_provider
 astrbot_version: ">=4.24.2"
